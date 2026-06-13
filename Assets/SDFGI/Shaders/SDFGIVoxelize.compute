@@ -1,0 +1,73 @@
+// SDFGIVoxelize.compute
+// Bake-time only. Rasterizes the static triangle soup into the voxel grid by
+// stepping barycentric samples at half-voxel density (the "basic" stand-in
+// for Godot's sub-voxel bitfield raster).
+
+#pragma kernel Clear
+#pragma kernel Voxelize
+
+struct SDFGITriangle
+{
+    float3 a;
+    float3 b;
+    float3 c;
+    float3 albedo;
+    float3 emissive;
+};
+
+StructuredBuffer<SDFGITriangle> _Triangles;
+int _TriangleCount;
+
+RWTexture3D<float4> _AlbedoRW;   // rgb albedo, a = solid flag
+RWTexture3D<float4> _EmissiveRW; // rgb emissive
+
+float3 _VolMin;     // world min of the voxel cube
+float  _VoxelSize;  // world units per voxel
+int    _Res;        // voxels per axis
+
+[numthreads(4, 4, 4)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_Res)) return;
+    _AlbedoRW[id]   = 0;
+    _EmissiveRW[id] = 0;
+}
+
+void WriteVoxel(float3 voxPos, float3 albedo, float3 emissive)
+{
+    int3 v = (int3)floor(voxPos);
+    if (any(v < 0) || any(v >= _Res)) return;
+    _AlbedoRW[v]   = float4(albedo, 1.0);
+    _EmissiveRW[v] = float4(emissive, 1.0);
+}
+
+[numthreads(64, 1, 1)]
+void Voxelize(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _TriangleCount) return;
+    SDFGITriangle tri = _Triangles[id.x];
+
+    // To voxel space
+    float3 va = (tri.a - _VolMin) / _VoxelSize;
+    float3 vb = (tri.b - _VolMin) / _VoxelSize;
+    float3 vc = (tri.c - _VolMin) / _VoxelSize;
+
+    float3 e1 = vb - va;
+    float3 e2 = vc - va;
+
+    // Sample at ~half-voxel steps along both edges. Capped to avoid TDR on
+    // gigantic triangles — keep huge floors reasonably tessellated.
+    int s1 = clamp((int)ceil(length(e1) * 2.0), 1, 2048);
+    int s2 = clamp((int)ceil(length(e2) * 2.0), 1, 2048);
+
+    for (int i = 0; i <= s1; i++)
+    {
+        float fi = (float)i / (float)s1;
+        for (int j = 0; j <= s2; j++)
+        {
+            float fj = (float)j / (float)s2;
+            if (fi + fj > 1.0001) break;
+            WriteVoxel(va + e1 * fi + e2 * fj, tri.albedo, tri.emissive);
+        }
+    }
+}

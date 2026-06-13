@@ -1,0 +1,79 @@
+// SDFGIJumpFlood.compute
+// Bake-time only. Standard 3D jump flooding over the solid voxels written by
+// SDFGIVoxelize, resolved to an (unsigned) distance field in voxel units.
+
+#pragma kernel Seed
+#pragma kernel Flood
+#pragma kernel Resolve
+
+Texture3D<float4>   _AlbedoTex;  // a > 0 = solid
+Texture3D<uint>     _SrcPtr;     // packed coord of closest seed (ping)
+RWTexture3D<uint>   _DstPtr;     // (pong)
+RWTexture3D<float>  _SDFOut;     // distance in voxels
+
+int _Res;
+int _Step;
+
+#define SDFGI_JFA_INVALID 0xFFFFFFFFu
+
+uint Pack(int3 c)
+{
+    return (uint)(c.x & 1023) | ((uint)(c.y & 1023) << 10) | ((uint)(c.z & 1023) << 20);
+}
+
+int3 Unpack(uint v)
+{
+    return int3(v & 1023, (v >> 10) & 1023, (v >> 20) & 1023);
+}
+
+[numthreads(4, 4, 4)]
+void Seed(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_Res)) return;
+    bool solid = _AlbedoTex[id].a > 0.0;
+    _DstPtr[id] = solid ? Pack((int3)id) : SDFGI_JFA_INVALID;
+}
+
+[numthreads(4, 4, 4)]
+void Flood(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_Res)) return;
+
+    int3 self = (int3)id;
+    uint best = _SrcPtr[id];
+    float bestD = (best == SDFGI_JFA_INVALID)
+        ? 1e10
+        : dot((float3)(self - Unpack(best)), (float3)(self - Unpack(best)));
+
+    [loop]
+    for (int z = -1; z <= 1; z++)
+    for (int y = -1; y <= 1; y++)
+    for (int x = -1; x <= 1; x++)
+    {
+        if (x == 0 && y == 0 && z == 0) continue;
+        int3 n = self + int3(x, y, z) * _Step;
+        if (any(n < 0) || any(n >= _Res)) continue;
+        uint v = _SrcPtr[n];
+        if (v == SDFGI_JFA_INVALID) continue;
+        float3 d = (float3)(self - Unpack(v));
+        float dd = dot(d, d);
+        if (dd < bestD)
+        {
+            bestD = dd;
+            best = v;
+        }
+    }
+
+    _DstPtr[id] = best;
+}
+
+[numthreads(4, 4, 4)]
+void Resolve(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_Res)) return;
+    uint v = _SrcPtr[id];
+    float d = (v == SDFGI_JFA_INVALID)
+        ? (float)_Res
+        : length((float3)((int3)id - Unpack(v)));
+    _SDFOut[id] = d;
+}

@@ -1,0 +1,320 @@
+// SDFGIProbes.compute
+// Per-frame probe update, following the "Tracing light into the probes"
+// section of the SDFGI doc, simplified to a single cascade:
+//   TraceRays        - 64 jittered octahedral rays per probe, sphere-traced
+//                      through the SDF. Direct sun (sphere-traced shadow),
+//                      emissive, sky on miss, and indirect bounce by reading
+//                      the previous frame's irradiance field at the hit.
+//   UpdateIrradiance - cosine-weighted integration into 6x6(+border)
+//                      octahedral probes, temporal lerp to converge.
+//   UpdateVisibility - distance / distance^2 moments into 14x14(+border)
+//                      octahedral depth probes (Chebyshev anti-leak data).
+
+#pragma kernel TraceRays
+#pragma kernel UpdateIrradiance
+#pragma kernel UpdateVisibility
+
+#include "SDFGICommon.hlsl"
+
+#define RAYS_PER_PROBE 64
+
+struct SDFGIRay
+{
+    float3 dir;
+    float  dist;     // world units (clamped to maxVisDist on miss)
+    float3 radiance;
+    float  backface; // 1 = hit a backface (probe inside geometry)
+};
+
+// --- resources -------------------------------------------------------------
+Texture3D<float>  _SDF;         // distance in voxels
+Texture3D<float4> _AlbedoTex;
+Texture3D<float4> _EmissiveTex;
+
+RWStructuredBuffer<SDFGIRay> _Rays;
+
+// Previous-frame atlases bound as SRVs via _SDFGIIrradianceAtlas /
+// _SDFGIVisibilityAtlas (declared in SDFGICommon.hlsl). Current-frame
+// targets:
+RWTexture2D<float4> _IrradianceRW;
+RWTexture2D<float2> _VisibilityRW;
+
+// --- uniforms ----------------------------------------------------------------
+float4x4 _RayRotation;   // random per-frame rotation for jitter
+float4 _SunDir;          // xyz = direction light travels (forward), w = 1 if sun present
+float4 _SunColor;        // rgb * intensity
+float4 _SkyColor;
+float4 _GroundColor;
+float  _Hysteresis;      // how much of the OLD value to keep (0..1)
+float  _BounceGain;
+int    _Res;             // SDF resolution
+float  _VoxelSize;       // world units per voxel
+int    _FirstFrame;
+
+// ----------------------------------------------------------------------------
+float SampleSDF(float3 voxPos)
+{
+    float3 uvw = (voxPos + 0.5) / (float)_Res;
+    return _SDF.SampleLevel(sdfgi_linear_clamp_sampler, uvw, 0);
+}
+
+float3 SDFNormal(float3 p)
+{
+    const float e = 1.0;
+    float3 n = float3(
+        SampleSDF(p + float3(e, 0, 0)) - SampleSDF(p - float3(e, 0, 0)),
+        SampleSDF(p + float3(0, e, 0)) - SampleSDF(p - float3(0, e, 0)),
+        SampleSDF(p + float3(0, 0, e)) - SampleSDF(p - float3(0, 0, e)));
+    float l = length(n);
+    return l > 1e-5 ? n / l : float3(0, 1, 0);
+}
+
+// Sphere trace in voxel space. Returns true on hit.
+bool Trace(float3 ro, float3 rd, float startBias, float tMax, out float t, out float3 hitPos)
+{
+    t = startBias;
+    hitPos = ro;
+    [loop]
+    for (int i = 0; i < 96; i++)
+    {
+        float3 p = ro + rd * t;
+        if (any(p < 0.0) || any(p > (float)(_Res - 1)))
+            return false;
+        float d = SampleSDF(p);
+        if (d < 0.4)
+        {
+            hitPos = p;
+            return true;
+        }
+        t += max(d * 0.9, 0.25);
+        if (t > tMax)
+            return false;
+    }
+    return false;
+}
+
+float3 SkyRadiance(float3 dir)
+{
+    return lerp(_GroundColor.rgb, _SkyColor.rgb, dir.y * 0.5 + 0.5);
+}
+
+int3 ProbeCoord(uint probeIdx)
+{
+    int g = (int)_SDFGIProbeGrid.x;
+    return int3(probeIdx % g, (probeIdx / g) % g, probeIdx / (g * g));
+}
+
+// ============================================================================
+// Kernel 1: trace all rays for one probe per group
+// ============================================================================
+[numthreads(RAYS_PER_PROBE, 1, 1)]
+void TraceRays(uint3 groupId : SV_GroupID, uint ti : SV_GroupIndex)
+{
+    uint probeIdx = groupId.x;
+    int3 pc = ProbeCoord(probeIdx);
+
+    float spacing = _SDFGIProbeSpacing.x;
+    float3 probeWorld = _SDFGIVolumeMin.xyz + (float3)pc * spacing;
+    float3 probeVox = (probeWorld - _SDFGIVolumeMin.xyz) / _VoxelSize;
+
+    // Stratified octahedral directions, rotated by a random per-frame matrix.
+    float2 octUV = (float2(ti % 8u, ti / 8u) + 0.5) / 8.0;
+    float3 dir = normalize(mul((float3x3)_RayRotation, SDFGI_OctDecode(octUV)));
+
+    SDFGIRay ray;
+    ray.dir = dir;
+    ray.backface = 0.0;
+
+    float maxVisDist = _SDFGIParams.z;
+    float t;
+    float3 hitVox;
+    float tMaxVox = (float)_Res * 1.8;
+
+    if (Trace(probeVox, dir, 1.0, tMaxVox, t, hitVox))
+    {
+        float3 n = SDFNormal(hitVox);
+        if (dot(n, dir) > 0.0)
+        {
+            // Backface — probe is likely inside geometry. Kill the radiance
+            // and report a tiny distance so visibility shuts this probe down.
+            ray.radiance = 0.0;
+            ray.dist = t * _VoxelSize * 0.2;
+            ray.backface = 1.0;
+        }
+        else
+        {
+            float3 hitWorld = _SDFGIVolumeMin.xyz + hitVox * _VoxelSize;
+
+            // Surface data: step slightly into the surface along the ray.
+            int3 sv = clamp((int3)floor(hitVox + dir * 1.0), 0, _Res - 1);
+            float4 alb4 = _AlbedoTex[sv];
+            if (alb4.a <= 0.0)
+                alb4 = _AlbedoTex[clamp((int3)floor(hitVox - n * 1.0), 0, _Res - 1)];
+            float3 albedo = alb4.a > 0.0 ? alb4.rgb : 0.5;
+            float3 emissive = _EmissiveTex[sv].rgb;
+
+            // Direct sun with a sphere-traced shadow ray.
+            float3 direct = 0.0;
+            if (_SunDir.w > 0.5)
+            {
+                float3 toSun = -_SunDir.xyz;
+                float ndl = saturate(dot(n, toSun));
+                if (ndl > 0.0)
+                {
+                    float st;
+                    float3 sh;
+                    bool occluded = Trace(hitVox + n * 1.5, toSun, 0.5, tMaxVox, st, sh);
+                    if (!occluded)
+                        direct = _SunColor.rgb * ndl;
+                }
+            }
+
+            // Indirect: read last frame's irradiance field at the hit point.
+            float3 indirect = SDFGI_SampleIrradiance(hitWorld, n) * _BounceGain;
+
+            ray.radiance = emissive + albedo * (direct + indirect);
+            ray.dist = t * _VoxelSize;
+        }
+    }
+    else
+    {
+        ray.radiance = SkyRadiance(dir);
+        ray.dist = maxVisDist;
+    }
+
+    ray.dist = min(ray.dist, maxVisDist);
+    _Rays[probeIdx * RAYS_PER_PROBE + ti] = ray;
+}
+
+// ============================================================================
+// Kernel 2: integrate rays into the irradiance probe (8x8 block, 6x6 interior)
+// ============================================================================
+groupshared float3 gsRadiance[RAYS_PER_PROBE];
+groupshared float3 gsDir[RAYS_PER_PROBE];
+groupshared float3 gsTexel[RAYS_PER_PROBE]; // 8x8 result block
+
+[numthreads(8, 8, 1)]
+void UpdateIrradiance(uint3 groupId : SV_GroupID, uint3 lt : SV_GroupThreadID)
+{
+    uint probeIdx = groupId.x;
+    uint flat = lt.x + lt.y * 8u;
+
+    // 64 threads load 64 rays into shared memory.
+    SDFGIRay r = _Rays[probeIdx * RAYS_PER_PROBE + flat];
+    gsRadiance[flat] = r.radiance;
+    gsDir[flat] = r.dir;
+    GroupMemoryBarrierWithGroupSync();
+
+    int3 pc = ProbeCoord(probeIdx);
+    int2 cell = int2(pc.x + pc.y * (int)_SDFGIProbeGrid.x, pc.z) * (int)SDFGI_IRR_TEXELS;
+    int2 pix = cell + int2(lt.xy);
+
+    bool interior = lt.x >= 1 && lt.x <= 6 && lt.y >= 1 && lt.y <= 6;
+    if (interior)
+    {
+        float2 octUV = (float2(lt.xy) - 1.0 + 0.5) / 6.0;
+        float3 texelDir = SDFGI_OctDecode(octUV);
+
+        float3 sum = 0.0;
+        float wSum = 0.0;
+        [loop]
+        for (uint k = 0; k < RAYS_PER_PROBE; k++)
+        {
+            float w = saturate(dot(texelDir, gsDir[k]));
+            sum += gsRadiance[k] * w;
+            wSum += w;
+        }
+        float3 result = sum / max(wSum, 1e-4);
+
+        float3 prev = _SDFGIIrradianceAtlas.Load(int3(pix, 0)).rgb;
+        float3 blended = (_FirstFrame == 1) ? result : lerp(result, prev, _Hysteresis);
+        gsTexel[flat] = blended;
+        _IrradianceRW[pix] = float4(blended, 1.0);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Border copy so bilinear filtering wraps octahedrally within the block.
+    if (!interior)
+    {
+        const int N = 8;
+        int2 l = int2(lt.xy);
+        int2 src;
+        bool cx = (l.x == 0 || l.x == N - 1);
+        bool cy = (l.y == 0 || l.y == N - 1);
+        if (cx && cy)        // corner -> diagonally opposite interior corner
+            src = int2(l.x == 0 ? N - 2 : 1, l.y == 0 ? N - 2 : 1);
+        else if (cy)         // top / bottom edge -> mirrored interior row
+            src = int2(N - 1 - l.x, l.y == 0 ? 1 : N - 2);
+        else                 // left / right edge -> mirrored interior column
+            src = int2(l.x == 0 ? 1 : N - 2, N - 1 - l.y);
+        _IrradianceRW[pix] = float4(gsTexel[src.x + src.y * 8], 1.0);
+    }
+}
+
+// ============================================================================
+// Kernel 3: integrate ray distances into the visibility probe
+// (16x16 block, 14x14 interior)
+// ============================================================================
+groupshared float3 gsVDir[RAYS_PER_PROBE];
+groupshared float  gsVDist[RAYS_PER_PROBE];
+groupshared float2 gsVTexel[256]; // 16x16 result block
+
+[numthreads(16, 16, 1)]
+void UpdateVisibility(uint3 groupId : SV_GroupID, uint3 lt : SV_GroupThreadID)
+{
+    uint probeIdx = groupId.x;
+    uint flat = lt.x + lt.y * 16u;
+
+    if (flat < RAYS_PER_PROBE)
+    {
+        SDFGIRay r = _Rays[probeIdx * RAYS_PER_PROBE + flat];
+        gsVDir[flat] = r.dir;
+        gsVDist[flat] = r.dist;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    int3 pc = ProbeCoord(probeIdx);
+    int2 cell = int2(pc.x + pc.y * (int)_SDFGIProbeGrid.x, pc.z) * (int)SDFGI_VIS_TEXELS;
+    int2 pix = cell + int2(lt.xy);
+
+    bool interior = lt.x >= 1 && lt.x <= 14 && lt.y >= 1 && lt.y <= 14;
+    if (interior)
+    {
+        float2 octUV = (float2(lt.xy) - 1.0 + 0.5) / 14.0;
+        float3 texelDir = SDFGI_OctDecode(octUV);
+
+        float2 sum = 0.0; // (dist, dist^2)
+        float wSum = 0.0;
+        [loop]
+        for (uint k = 0; k < RAYS_PER_PROBE; k++)
+        {
+            float w = pow(saturate(dot(texelDir, gsVDir[k])), 32.0);
+            sum += float2(gsVDist[k], gsVDist[k] * gsVDist[k]) * w;
+            wSum += w;
+        }
+        float2 result = wSum > 1e-5 ? sum / wSum
+                                    : float2(_SDFGIParams.z, _SDFGIParams.z * _SDFGIParams.z);
+
+        float2 prev = _SDFGIVisibilityAtlas.Load(int3(pix, 0)).rg;
+        float2 blended = (_FirstFrame == 1) ? result : lerp(result, prev, _Hysteresis);
+        gsVTexel[flat] = blended;
+        _VisibilityRW[pix] = blended;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!interior)
+    {
+        const int N = 16;
+        int2 l = int2(lt.xy);
+        int2 src;
+        bool cx = (l.x == 0 || l.x == N - 1);
+        bool cy = (l.y == 0 || l.y == N - 1);
+        if (cx && cy)
+            src = int2(l.x == 0 ? N - 2 : 1, l.y == 0 ? N - 2 : 1);
+        else if (cy)
+            src = int2(N - 1 - l.x, l.y == 0 ? 1 : N - 2);
+        else
+            src = int2(l.x == 0 ? 1 : N - 2, N - 1 - l.y);
+        _VisibilityRW[pix] = gsVTexel[src.x + src.y * 16];
+    }
+}
